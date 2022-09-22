@@ -37,6 +37,7 @@ import zlib
 from typing import Any, Callable, Coroutine, Deque, Dict, List, TYPE_CHECKING, NamedTuple, Optional, TypeVar
 
 import aiohttp
+import yarl
 
 from . import utils
 from .activity import BaseActivity
@@ -287,10 +288,11 @@ class DiscordWebSocket:
         _initial_identify: bool
         shard_id: Optional[int]
         shard_count: Optional[int]
-        gateway: str
+        gateway: yarl.URL
         _max_heartbeat_timeout: float
 
     # fmt: off
+    DEFAULT_GATEWAY    = yarl.URL('wss://gateway.discord.gg/')
     DISPATCH           = 0
     HEARTBEAT          = 1
     IDENTIFY           = 2
@@ -345,18 +347,29 @@ class DiscordWebSocket:
         client: Client,
         *,
         initial: bool = False,
-        gateway: Optional[str] = None,
+        gateway: Optional[yarl.URL] = None,
         shard_id: Optional[int] = None,
         session: Optional[str] = None,
         sequence: Optional[int] = None,
         resume: bool = False,
+        encoding: str = 'json',
+        zlib: bool = True,
     ) -> Self:
         """Creates a main websocket for Discord from a :class:`Client`.
 
         This is for internal use only.
         """
-        gateway = gateway or await client.http.get_gateway()
-        socket = await client.http.ws_connect(gateway)
+        # Circular import
+        from .http import INTERNAL_API_VERSION
+
+        gateway = gateway or cls.DEFAULT_GATEWAY
+
+        if zlib:
+            url = gateway.with_query(v=INTERNAL_API_VERSION, encoding=encoding, compress='zlib-stream')
+        else:
+            url = gateway.with_query(v=INTERNAL_API_VERSION, encoding=encoding)
+
+        socket = await client.http.ws_connect(str(url))
         ws = cls(socket, loop=client.loop)
 
         # dynamically add attributes needed
@@ -429,11 +442,9 @@ class DiscordWebSocket:
             'd': {
                 'token': self.token,
                 'properties': {
-                    '$os': sys.platform,
-                    '$browser': 'discord.py',
-                    '$device': 'discord.py',
-                    '$referrer': '',
-                    '$referring_domain': '',
+                    'os': sys.platform,
+                    'browser': 'discord.py',
+                    'device': 'discord.py',
                 },
                 'compress': True,
                 'large_threshold': 250,
@@ -457,7 +468,7 @@ class DiscordWebSocket:
 
         await self.call_hooks('before_identify', self.shard_id, initial=self._initial_identify)
         await self.send_as_json(payload)
-        _log.info('Shard ID %s has sent the IDENTIFY payload.', self.shard_id)
+        _log.debug('Shard ID %s has sent the IDENTIFY payload.', self.shard_id)
 
     async def resume(self) -> None:
         """Sends the RESUME packet."""
@@ -471,7 +482,7 @@ class DiscordWebSocket:
         }
 
         await self.send_as_json(payload)
-        _log.info('Shard ID %s has sent the RESUME payload.', self.shard_id)
+        _log.debug('Shard ID %s has sent the RESUME payload.', self.shard_id)
 
     async def received_message(self, msg: Any, /) -> None:
         if type(msg) is bytes:
@@ -535,6 +546,7 @@ class DiscordWebSocket:
 
                 self.sequence = None
                 self.session_id = None
+                self.gateway = self.DEFAULT_GATEWAY
                 _log.info('Shard ID %s session has been invalidated.', self.shard_id)
                 await self.close(code=1000)
                 raise ReconnectWebSocket(self.shard_id, resume=False)
@@ -543,28 +555,15 @@ class DiscordWebSocket:
             return
 
         if event == 'READY':
-            self._trace = trace = data.get('_trace', [])
             self.sequence = msg['s']
             self.session_id = data['session_id']
-            # pass back shard ID to ready handler
-            data['__shard_id__'] = self.shard_id
-            _log.info(
-                'Shard ID %s has connected to Gateway: %s (Session ID: %s).',
-                self.shard_id,
-                ', '.join(trace),
-                self.session_id,
-            )
+            self.gateway = yarl.URL(data['resume_gateway_url'])
+            _log.info('Shard ID %s has connected to Gateway (Session ID: %s).', self.shard_id, self.session_id)
 
         elif event == 'RESUMED':
-            self._trace = trace = data.get('_trace', [])
             # pass back the shard ID to the resumed handler
             data['__shard_id__'] = self.shard_id
-            _log.info(
-                'Shard ID %s has successfully RESUMED session %s under trace %s.',
-                self.shard_id,
-                self.session_id,
-                ', '.join(trace),
-            )
+            _log.info('Shard ID %s has successfully RESUMED session %s.', self.shard_id, self.session_id)
 
         try:
             func = self._discord_parsers[event]
@@ -635,15 +634,15 @@ class DiscordWebSocket:
                 self._keep_alive = None
 
             if isinstance(e, asyncio.TimeoutError):
-                _log.info('Timed out receiving packet. Attempting a reconnect.')
+                _log.debug('Timed out receiving packet. Attempting a reconnect.')
                 raise ReconnectWebSocket(self.shard_id) from None
 
             code = self._close_code or self.socket.close_code
             if self._can_handle_close():
-                _log.info('Websocket closed with %s, attempting a reconnect.', code)
+                _log.debug('Websocket closed with %s, attempting a reconnect.', code)
                 raise ReconnectWebSocket(self.shard_id) from None
             else:
-                _log.info('Websocket closed with %s, cannot reconnect.', code)
+                _log.debug('Websocket closed with %s, cannot reconnect.', code)
                 raise ConnectionClosed(self.socket, shard_id=self.shard_id, code=code) from None
 
     async def debug_send(self, data: str, /) -> None:
@@ -828,7 +827,7 @@ class DiscordVoiceWebSocket:
         self._close_code: Optional[int] = None
         self.secret_key: Optional[str] = None
         if hook:
-            self._hook = hook  # type: ignore # type-checker doesn't like overriding methods
+            self._hook = hook
 
     async def _hook(self, *args: Any) -> None:
         pass
@@ -932,7 +931,7 @@ class DiscordVoiceWebSocket:
             if self._keep_alive:
                 self._keep_alive.ack()
         elif op == self.RESUMED:
-            _log.info('Voice RESUME succeeded.')
+            _log.debug('Voice RESUME succeeded.')
         elif op == self.SESSION_DESCRIPTION:
             self._connection.mode = data['mode']
             await self.load_secret_key(data)
@@ -971,7 +970,7 @@ class DiscordVoiceWebSocket:
 
         mode = modes[0]
         await self.select_protocol(state.ip, state.port, mode)
-        _log.info('selected the voice protocol for use (%s)', mode)
+        _log.debug('selected the voice protocol for use (%s)', mode)
 
     @property
     def latency(self) -> float:
@@ -989,7 +988,7 @@ class DiscordVoiceWebSocket:
         return sum(heartbeat.recent_ack_latencies) / len(heartbeat.recent_ack_latencies)
 
     async def load_secret_key(self, data: Dict[str, Any]) -> None:
-        _log.info('received secret key for voice connection')
+        _log.debug('received secret key for voice connection')
         self.secret_key = self._connection.secret_key = data['secret_key']
         await self.speak()
         await self.speak(SpeakingState.none)

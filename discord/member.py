@@ -28,7 +28,7 @@ import datetime
 import inspect
 import itertools
 from operator import attrgetter
-from typing import Any, Awaitable, Callable, Collection, Dict, List, Optional, TYPE_CHECKING, Tuple, Union, Type
+from typing import Any, Awaitable, Callable, Collection, Dict, List, Optional, TYPE_CHECKING, Tuple, TypeVar, Union
 
 import discord.abc
 
@@ -47,6 +47,8 @@ __all__ = (
     'VoiceState',
     'Member',
 )
+
+T = TypeVar('T', bound=type)
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -205,7 +207,7 @@ class _ClientStatus:
         return self
 
 
-def flatten_user(cls: Any) -> Type[Member]:
+def flatten_user(cls: T) -> T:
     for attr, value in itertools.chain(BaseUser.__dict__.items(), User.__dict__.items()):
         # ignore private/special methods
         if attr.startswith('_'):
@@ -709,14 +711,20 @@ class Member(discord.abc.Messageable, _UserTag):
     async def ban(
         self,
         *,
-        delete_message_days: int = 1,
+        delete_message_days: int = MISSING,
+        delete_message_seconds: int = MISSING,
         reason: Optional[str] = None,
     ) -> None:
         """|coro|
 
         Bans this member. Equivalent to :meth:`Guild.ban`.
         """
-        await self.guild.ban(self, reason=reason, delete_message_days=delete_message_days)
+        await self.guild.ban(
+            self,
+            reason=reason,
+            delete_message_days=delete_message_days,
+            delete_message_seconds=delete_message_seconds,
+        )
 
     async def unban(self, *, reason: Optional[str] = None) -> None:
         """|coro|
@@ -813,8 +821,8 @@ class Member(discord.abc.Messageable, _UserTag):
         Returns
         --------
         Optional[:class:`.Member`]
-            The newly updated member, if applicable. This is only returned
-            when certain fields are updated.
+            The newly updated member, if applicable. This is not returned
+            if certain fields are passed, such as ``suppress``.
         """
         http = self._state.http
         guild_id = self.guild.id
@@ -914,8 +922,7 @@ class Member(discord.abc.Messageable, _UserTag):
 
         Moves a member to a new voice channel (they must be connected first).
 
-        You must have the :attr:`~Permissions.move_members` permission to
-        use this.
+        You must have :attr:`~Permissions.move_members` to do this.
 
         This raises the same exceptions as :meth:`edit`.
 
@@ -940,8 +947,7 @@ class Member(discord.abc.Messageable, _UserTag):
         Applies a time out to a member until the specified date time or for the
         given :class:`datetime.timedelta`.
 
-        You must have the :attr:`~Permissions.moderate_members` permission to
-        use this.
+        You must have :attr:`~Permissions.moderate_members` to do this.
 
         This raises the same exceptions as :meth:`edit`.
 
@@ -968,7 +974,7 @@ class Member(discord.abc.Messageable, _UserTag):
         elif isinstance(until, datetime.datetime):
             timed_out_until = until
         else:
-            raise TypeError(f'expected None, datetime.datetime, or datetime.timedelta not {until.__class__!r}')
+            raise TypeError(f'expected None, datetime.datetime, or datetime.timedelta not {until.__class__.__name__}')
 
         await self.edit(timed_out_until=timed_out_until, reason=reason)
 
@@ -977,7 +983,7 @@ class Member(discord.abc.Messageable, _UserTag):
 
         Gives the member a number of :class:`Role`\s.
 
-        You must have the :attr:`~Permissions.manage_roles` permission to
+        You must have :attr:`~Permissions.manage_roles` to
         use this, and the added :class:`Role`\s must appear lower in the list
         of roles than the highest role of the member.
 
@@ -1016,7 +1022,7 @@ class Member(discord.abc.Messageable, _UserTag):
 
         Removes :class:`Role`\s from this member.
 
-        You must have the :attr:`~Permissions.manage_roles` permission to
+        You must have :attr:`~Permissions.manage_roles` to
         use this, and the removed :class:`Role`\s must appear lower in the list
         of roles than the highest role of the member.
 

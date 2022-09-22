@@ -31,6 +31,7 @@ from typing import (
     ClassVar,
     Dict,
     List,
+    Tuple,
     Type,
     TypeVar,
     Union,
@@ -43,8 +44,9 @@ from discord import app_commands
 from discord.utils import MISSING, maybe_coroutine, async_all
 from .core import Command, Group
 from .errors import BadArgument, CommandRegistrationError, CommandError, HybridCommandError, ConversionError
-from .converter import Converter, Range, Greedy, run_converters
+from .converter import Converter, Range, Greedy, run_converters, CONVERTER_MAPPING
 from .parameters import Parameter
+from .flags import is_flag, FlagConverter
 from .cog import Cog
 from .view import StringView
 
@@ -114,56 +116,159 @@ def required_pos_arguments(func: Callable[..., Any]) -> int:
     return sum(p.default is p.empty for p in sig.parameters.values())
 
 
-def make_converter_transformer(converter: Any) -> Type[app_commands.Transformer]:
-    async def transform(cls, interaction: discord.Interaction, value: str) -> Any:
+class ConverterTransformer(app_commands.Transformer):
+    def __init__(self, converter: Any, parameter: Parameter) -> None:
+        super().__init__()
+        self.converter: Any = converter
+        self.parameter: Parameter = parameter
+
+        try:
+            module = converter.__module__
+        except AttributeError:
+            pass
+        else:
+            if module is not None and (module.startswith('discord.') and not module.endswith('converter')):
+                self.converter = CONVERTER_MAPPING.get(converter, converter)
+
+    async def transform(self, interaction: discord.Interaction, value: str, /) -> Any:
+        ctx = interaction._baton
+        converter = self.converter
+        ctx.current_parameter = self.parameter
+        ctx.current_argument = value
         try:
             if inspect.isclass(converter) and issubclass(converter, Converter):
                 if inspect.ismethod(converter.convert):
-                    return await converter.convert(interaction._baton, value)
+                    return await converter.convert(ctx, value)
                 else:
-                    return await converter().convert(interaction._baton, value)  # type: ignore
+                    return await converter().convert(ctx, value)
             elif isinstance(converter, Converter):
-                return await converter.convert(interaction._baton, value)  # type: ignore
+                return await converter.convert(ctx, value)
         except CommandError:
             raise
         except Exception as exc:
             raise ConversionError(converter, exc) from exc  # type: ignore
 
-    return type('ConverterTransformer', (app_commands.Transformer,), {'transform': classmethod(transform)})
 
+class CallableTransformer(app_commands.Transformer):
+    def __init__(self, func: Callable[[str], Any]) -> None:
+        super().__init__()
+        self.func: Callable[[str], Any] = func
 
-def make_callable_transformer(func: Callable[[str], Any]) -> Type[app_commands.Transformer]:
-    async def transform(cls, interaction: discord.Interaction, value: str) -> Any:
+    async def transform(self, interaction: discord.Interaction, value: str, /) -> Any:
         try:
-            return func(value)
+            return self.func(value)
         except CommandError:
             raise
         except Exception as exc:
-            raise BadArgument(f'Converting to "{func.__name__}" failed') from exc
-
-    return type('CallableTransformer', (app_commands.Transformer,), {'transform': classmethod(transform)})
+            raise BadArgument(f'Converting to "{self.func.__name__}" failed') from exc
 
 
-def make_greedy_transformer(converter: Any, parameter: Parameter) -> Type[app_commands.Transformer]:
-    async def transform(cls, interaction: discord.Interaction, value: str) -> Any:
+class GreedyTransformer(app_commands.Transformer):
+    def __init__(self, converter: Any, parameter: Parameter) -> None:
+        super().__init__()
+        self.converter: Any = converter
+        self.parameter: Parameter = parameter
+
+    async def transform(self, interaction: discord.Interaction, value: str, /) -> Any:
         view = StringView(value)
         result = []
+        ctx = interaction._baton
+        ctx.current_parameter = parameter = self.parameter
+        converter = self.converter
+
         while True:
             view.skip_ws()
-            arg = view.get_quoted_word()
+            ctx.current_argument = arg = view.get_quoted_word()
             if arg is None:
                 break
 
             # This propagates the exception
-            converted = await run_converters(interaction._baton, converter, arg, parameter)
+            converted = await run_converters(ctx, converter, arg, parameter)
             result.append(converted)
 
         return result
 
-    return type('GreedyTransformer', (app_commands.Transformer,), {'transform': classmethod(transform)})
+
+def replace_parameter(
+    param: inspect.Parameter,
+    converter: Any,
+    callback: Callable[..., Any],
+    original: Parameter,
+    mapping: Dict[str, inspect.Parameter],
+) -> inspect.Parameter:
+    try:
+        # If it's a supported annotation (i.e. a transformer) just let it pass as-is.
+        app_commands.transformers.get_supported_annotation(converter)
+    except TypeError:
+        # Fallback to see if the behaviour needs changing
+        origin = getattr(converter, '__origin__', None)
+        args = getattr(converter, '__args__', [])
+        if isinstance(converter, Range):
+            r = converter
+            param = param.replace(annotation=app_commands.Range[r.annotation, r.min, r.max])
+        elif isinstance(converter, Greedy):
+            # Greedy is "optional" in ext.commands
+            # However, in here, it probably makes sense to make it required.
+            # I'm unsure how to allow the user to choose right now.
+            inner = converter.converter
+            if inner is discord.Attachment:
+                raise TypeError('discord.Attachment with Greedy is not supported in hybrid commands')
+
+            param = param.replace(annotation=GreedyTransformer(inner, original))
+        elif is_flag(converter):
+            callback.__hybrid_command_flag__ = (param.name, converter)
+            descriptions = {}
+            renames = {}
+            for flag in converter.__commands_flags__.values():
+                name = flag.attribute
+                flag_param = inspect.Parameter(
+                    name=name,
+                    kind=param.kind,
+                    default=flag.default if flag.default is not MISSING else inspect.Parameter.empty,
+                    annotation=flag.annotation,
+                )
+                pseudo = replace_parameter(flag_param, flag.annotation, callback, original, mapping)
+                if name in mapping:
+                    raise TypeError(f'{name!r} flag would shadow a pre-existing parameter')
+                if flag.description is not MISSING:
+                    descriptions[name] = flag.description
+                if flag.name != flag.attribute:
+                    renames[name] = flag.name
+
+                mapping[name] = pseudo
+
+            # Manually call the decorators
+            if descriptions:
+                app_commands.describe(**descriptions)(callback)
+            if renames:
+                app_commands.rename(**renames)(callback)
+
+        elif is_converter(converter) or converter in CONVERTER_MAPPING:
+            param = param.replace(annotation=ConverterTransformer(converter, original))
+        elif origin is Union:
+            if len(args) == 2 and args[-1] is _NoneType:
+                # Special case Optional[X] where X is a single type that can optionally be a converter
+                inner = args[0]
+                is_inner_transformer = is_transformer(inner)
+                if is_converter(inner) and not is_inner_transformer:
+                    param = param.replace(annotation=Optional[ConverterTransformer(inner, original)])  # type: ignore
+            else:
+                raise
+        elif origin:
+            # Unsupported typing.X annotation e.g. typing.Dict, typing.Tuple, typing.List, etc.
+            raise
+        elif callable(converter) and not inspect.isclass(converter):
+            param_count = required_pos_arguments(converter)
+            if param_count != 1:
+                raise
+            param = param.replace(annotation=CallableTransformer(converter))
+
+    return param
 
 
-def replace_parameters(parameters: Dict[str, Parameter], signature: inspect.Signature) -> List[inspect.Parameter]:
+def replace_parameters(
+    parameters: Dict[str, Parameter], callback: Callable[..., Any], signature: inspect.Signature
+) -> List[inspect.Parameter]:
     # Need to convert commands.Parameter back to inspect.Parameter so this will be a bit ugly
     params = signature.parameters.copy()
     for name, parameter in parameters.items():
@@ -171,38 +276,7 @@ def replace_parameters(parameters: Dict[str, Parameter], signature: inspect.Sign
         # Parameter.converter properly infers from the default and has a str default
         # This allows the actual signature to inherit this property
         param = params[name].replace(annotation=converter)
-        try:
-            # If it's a supported annotation (i.e. a transformer) just let it pass as-is.
-            app_commands.transformers.get_supported_annotation(converter)
-        except TypeError:
-            # Fallback to see if the behaviour needs changing
-            origin = getattr(converter, '__origin__', None)
-            args = getattr(converter, '__args__', [])
-            if isinstance(converter, Range):
-                r = converter
-                param = param.replace(annotation=app_commands.Range[r.annotation, r.min, r.max])  # type: ignore
-            elif isinstance(converter, Greedy):
-                # Greedy is "optional" in ext.commands
-                # However, in here, it probably makes sense to make it required.
-                # I'm unsure how to allow the user to choose right now.
-                inner = converter.converter
-                param = param.replace(annotation=make_greedy_transformer(inner, parameter))
-            elif is_converter(converter):
-                param = param.replace(annotation=make_converter_transformer(converter))
-            elif origin is Union:
-                if len(args) == 2 and args[-1] is _NoneType:
-                    # Special case Optional[X] where X is a single type that can optionally be a converter
-                    inner = args[0]
-                    is_inner_tranformer = is_transformer(inner)
-                    if is_converter(inner) and not is_inner_tranformer:
-                        param = param.replace(annotation=Optional[make_converter_transformer(inner)])  # type: ignore
-                else:
-                    raise
-            elif callable(converter) and not inspect.isclass(converter):
-                param_count = required_pos_arguments(converter)
-                if param_count != 1:
-                    raise
-                param = param.replace(annotation=make_callable_transformer(converter))
+        param = replace_parameter(param, converter, callback, parameter, params)
 
         if parameter.default is not parameter.empty:
             default = _CallableDefault(parameter.default) if callable(parameter.default) else parameter.default
@@ -212,32 +286,44 @@ def replace_parameters(parameters: Dict[str, Parameter], signature: inspect.Sign
             # If we're here, then then it hasn't been handled yet so it should be removed completely
             param = param.replace(default=parameter.empty)
 
+        # Flags are flattened out and thus don't get their parameter in the actual mapping
+        if hasattr(converter, '__commands_is_flag__'):
+            del params[name]
+            continue
+
         params[name] = param
 
     return list(params.values())
 
 
 class HybridAppCommand(discord.app_commands.Command[CogT, P, T]):
-    def __init__(self, wrapped: Command[CogT, Any, T]) -> None:
+    def __init__(self, wrapped: Union[HybridCommand[CogT, Any, T], HybridGroup[CogT, Any, T]]) -> None:
         signature = inspect.signature(wrapped.callback)
-        params = replace_parameters(wrapped.params, signature)
+        params = replace_parameters(wrapped.params, wrapped.callback, signature)
         wrapped.callback.__signature__ = signature.replace(parameters=params)
-
+        nsfw = getattr(wrapped.callback, '__discord_app_commands_is_nsfw__', False)
         try:
             super().__init__(
-                name=wrapped.name,
+                name=wrapped._locale_name or wrapped.name,
                 callback=wrapped.callback,  # type: ignore # Signature doesn't match but we're overriding the invoke
-                description=wrapped.description or wrapped.short_doc or '…',
+                description=wrapped._locale_description or wrapped.description or wrapped.short_doc or '…',
+                nsfw=nsfw,
             )
         finally:
             del wrapped.callback.__signature__
 
-        self.wrapped: Command[CogT, Any, T] = wrapped
-        self.binding = wrapped.cog
+        self.wrapped: Union[HybridCommand[CogT, Any, T], HybridGroup[CogT, Any, T]] = wrapped
+        self.binding: Optional[CogT] = wrapped.cog
+        # This technically means only one flag converter is supported
+        self.flag_converter: Optional[Tuple[str, Type[FlagConverter]]] = getattr(
+            wrapped.callback, '__hybrid_command_flag__', None
+        )
+        self.module = wrapped.module
 
     def _copy_with(self, **kwargs) -> Self:
         copy: Self = super()._copy_with(**kwargs)  # type: ignore
         copy.wrapped = self.wrapped
+        copy.flag_converter = self.flag_converter
         return copy
 
     def copy(self) -> Self:
@@ -265,6 +351,19 @@ class HybridAppCommand(discord.app_commands.Command[CogT, P, T]):
                     raise app_commands.CommandSignatureMismatch(self) from None
             else:
                 transformed_values[param.name] = await param.transform(interaction, value)
+
+        if self.flag_converter is not None:
+            param_name, flag_cls = self.flag_converter
+            flag = flag_cls.__new__(flag_cls)
+            for f in flag_cls.__commands_flags__.values():
+                try:
+                    value = transformed_values.pop(f.attribute)
+                except KeyError:
+                    raise app_commands.CommandSignatureMismatch(self) from None
+                else:
+                    setattr(flag, f.attribute, value)
+
+            transformed_values[param_name] = flag
 
         return transformed_values
 
@@ -313,10 +412,10 @@ class HybridAppCommand(discord.app_commands.Command[CogT, P, T]):
                 if not ret:
                     return False
 
-        if self.checks and not await async_all(f(interaction) for f in self.checks):  # type: ignore
+        if self.checks and not await async_all(f(interaction) for f in self.checks):
             return False
 
-        if self.wrapped.checks and not await async_all(f(ctx) for f in self.wrapped.checks):  # type: ignore
+        if self.wrapped.checks and not await async_all(f(ctx) for f in self.wrapped.checks):
             return False
 
         return True
@@ -332,10 +431,12 @@ class HybridAppCommand(discord.app_commands.Command[CogT, P, T]):
         command = self.wrapped
         bot.dispatch('command', ctx)
         value = None
+        callback_completed = False
         try:
             await command.prepare(ctx)
             # This lies and just always passes a Context instead of an Interaction.
             value = await self._do_call(ctx, ctx.kwargs)  # type: ignore
+            callback_completed = True
         except app_commands.CommandSignatureMismatch:
             raise
         except (app_commands.TransformerError, app_commands.CommandInvokeError) as e:
@@ -355,11 +456,13 @@ class HybridAppCommand(discord.app_commands.Command[CogT, P, T]):
             if command._max_concurrency is not None:
                 await command._max_concurrency.release(ctx.message)
 
-            await command.call_after_hooks(ctx)
+            if callback_completed:
+                await command.call_after_hooks(ctx)
 
         if not ctx.command_failed:
             bot.dispatch('command_completion', ctx)
 
+        interaction.command_failed = ctx.command_failed
         return value
 
 
@@ -381,12 +484,30 @@ class HybridCommand(Command[CogT, P, T]):
 
     def __init__(
         self,
-        func: CommandCallback[CogT, ContextT, P, T],
+        func: CommandCallback[CogT, Context[Any], P, T],
         /,
-        **kwargs,
+        *,
+        name: Union[str, app_commands.locale_str] = MISSING,
+        description: Union[str, app_commands.locale_str] = MISSING,
+        **kwargs: Any,
     ) -> None:
+        name, name_locale = (name.message, name) if isinstance(name, app_commands.locale_str) else (name, None)
+        if name is not MISSING:
+            kwargs['name'] = name
+        description, description_locale = (
+            (description.message, description) if isinstance(description, app_commands.locale_str) else (description, None)
+        )
+        if description is not MISSING:
+            kwargs['description'] = description
+
         super().__init__(func, **kwargs)
-        self.app_command: HybridAppCommand[CogT, Any, T] = HybridAppCommand(self)
+        self.with_app_command: bool = kwargs.pop('with_app_command', True)
+        self._locale_name: Optional[app_commands.locale_str] = name_locale
+        self._locale_description: Optional[app_commands.locale_str] = description_locale
+
+        self.app_command: Optional[HybridAppCommand[CogT, Any, T]] = (
+            HybridAppCommand(self) if self.with_app_command else None
+        )
 
     @property
     def cog(self) -> CogT:
@@ -395,25 +516,29 @@ class HybridCommand(Command[CogT, P, T]):
     @cog.setter
     def cog(self, value: CogT) -> None:
         self._cog = value
-        self.app_command.binding = value
+        if self.app_command is not None:
+            self.app_command.binding = value
 
     async def can_run(self, ctx: Context[BotT], /) -> bool:
-        if ctx.interaction is None:
-            return await super().can_run(ctx)
-        else:
+        if ctx.interaction is not None and self.app_command:
             return await self.app_command._check_can_run(ctx.interaction)
+        else:
+            return await super().can_run(ctx)
 
     async def _parse_arguments(self, ctx: Context[BotT]) -> None:
         interaction = ctx.interaction
         if interaction is None:
             return await super()._parse_arguments(ctx)
-        else:
+        elif self.app_command:
             ctx.kwargs = await self.app_command._transform_arguments(interaction, interaction.namespace)
 
     def _ensure_assignment_on_copy(self, other: Self) -> Self:
         copy = super()._ensure_assignment_on_copy(other)
-        copy.app_command = self.app_command.copy()
-        copy.app_command.wrapped = copy
+        if self.app_command is None:
+            copy.app_command = None
+        else:
+            copy.app_command = self.app_command.copy()
+            copy.app_command.wrapped = copy
         return copy
 
     def autocomplete(
@@ -441,6 +566,9 @@ class HybridCommand(Command[CogT, P, T]):
             The coroutine passed is not actually a coroutine or
             the parameter is not found or of an invalid type.
         """
+        if self.app_command is None:
+            raise TypeError('This command does not have a registered application command')
+
         return self.app_command.autocomplete(name)
 
 
@@ -470,9 +598,28 @@ class HybridGroup(Group[CogT, P, T]):
 
     __commands_is_hybrid__: ClassVar[bool] = True
 
-    def __init__(self, *args: Any, fallback: Optional[str] = None, **attrs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        name: Union[str, app_commands.locale_str] = MISSING,
+        description: Union[str, app_commands.locale_str] = MISSING,
+        fallback: Optional[str] = None,
+        **attrs: Any,
+    ) -> None:
+        name, name_locale = (name.message, name) if isinstance(name, app_commands.locale_str) else (name, None)
+        if name is not MISSING:
+            attrs['name'] = name
+        description, description_locale = (
+            (description.message, description) if isinstance(description, app_commands.locale_str) else (description, None)
+        )
+        if description is not MISSING:
+            attrs['description'] = description
         super().__init__(*args, **attrs)
         self.invoke_without_command = True
+        self.with_app_command: bool = attrs.pop('with_app_command', True)
+        self._locale_name: Optional[app_commands.locale_str] = name_locale
+        self._locale_description: Optional[app_commands.locale_str] = description_locale
+
         parent = None
         if self.parent is not None:
             if isinstance(self.parent, HybridGroup):
@@ -480,24 +627,41 @@ class HybridGroup(Group[CogT, P, T]):
             else:
                 raise TypeError(f'HybridGroup parent must be HybridGroup not {self.parent.__class__}')
 
-        guild_ids = attrs.pop('guild_ids', None) or getattr(self.callback, '__discord_app_commands_default_guilds__', None)
-        self.app_command: app_commands.Group = app_commands.Group(
-            name=self.name,
-            description=self.description or self.short_doc or '…',
-            guild_ids=guild_ids,
-        )
-
-        # This prevents the group from re-adding the command at __init__
-        self.app_command.parent = parent
+        # I would love for this to be Optional[app_commands.Group]
+        # However, Python does not have conditional typing so it's very hard to
+        # make this type depend on the with_app_command bool without a lot of needless repetition
+        self.app_command: app_commands.Group = MISSING
         self.fallback: Optional[str] = fallback
 
-        if fallback is not None:
-            command = HybridAppCommand(self)
-            command.name = fallback
-            self.app_command.add_command(command)
+        if self.with_app_command:
+            guild_ids = attrs.pop('guild_ids', None) or getattr(
+                self.callback, '__discord_app_commands_default_guilds__', None
+            )
+            guild_only = getattr(self.callback, '__discord_app_commands_guild_only__', False)
+            default_permissions = getattr(self.callback, '__discord_app_commands_default_permissions__', None)
+            nsfw = getattr(self.callback, '__discord_app_commands_is_nsfw__', False)
+            self.app_command = app_commands.Group(
+                name=self._locale_name or self.name,
+                description=self._locale_description or self.description or self.short_doc or '…',
+                guild_ids=guild_ids,
+                guild_only=guild_only,
+                default_permissions=default_permissions,
+                nsfw=nsfw,
+            )
+
+            # This prevents the group from re-adding the command at __init__
+            self.app_command.parent = parent
+            self.app_command.module = self.module
+
+            if fallback is not None:
+                command = HybridAppCommand(self)
+                command.name = fallback
+                self.app_command.add_command(command)
 
     @property
     def _fallback_command(self) -> Optional[HybridAppCommand[CogT, ..., T]]:
+        if self.app_command is MISSING:
+            return None
         return self.app_command.get_command(self.fallback)  # type: ignore
 
     @property
@@ -529,6 +693,24 @@ class HybridGroup(Group[CogT, P, T]):
     def _ensure_assignment_on_copy(self, other: Self) -> Self:
         copy = super()._ensure_assignment_on_copy(other)
         copy.fallback = self.fallback
+        return copy
+
+    def _update_copy(self, kwargs: Dict[str, Any]) -> Self:
+        copy = super()._update_copy(kwargs)
+        # This is only really called inside CogMeta
+        # I want to ensure that the children of the app command are copied
+        # For example, if someone defines an app command using the app_command property
+        # while inside the cog. This copy is not propagated in normal means.
+        # For some reason doing this copy above will lead to duplicates.
+        if copy.app_command and self.app_command:
+            # This is a very lazy copy because the CogMeta will properly copy it
+            # with bindings and all later
+            copy.app_command._children = self.app_command._children.copy()
+
+        # Ensure the copy's fallback wraps the copy
+        if copy._fallback_command and self._fallback_command:
+            copy._fallback_command.wrapped = copy
+
         return copy
 
     def autocomplete(
@@ -592,7 +774,9 @@ class HybridGroup(Group[CogT, P, T]):
         if isinstance(command, HybridGroup) and self.parent is not None:
             raise ValueError(f'{command.qualified_name!r} is too nested, groups can only be nested at most one level')
 
-        self.app_command.add_command(command.app_command)
+        if command.app_command and self.app_command:
+            self.app_command.add_command(command.app_command)
+
         command.parent = self
 
         if command.name in self.all_commands:
@@ -607,13 +791,15 @@ class HybridGroup(Group[CogT, P, T]):
 
     def remove_command(self, name: str, /) -> Optional[Command[CogT, ..., Any]]:
         cmd = super().remove_command(name)
-        self.app_command.remove_command(name)
+        if self.app_command:
+            self.app_command.remove_command(name)
         return cmd
 
     def command(
         self,
-        name: str = MISSING,
+        name: Union[str, app_commands.locale_str] = MISSING,
         *args: Any,
+        with_app_command: bool = True,
         **kwargs: Any,
     ) -> Callable[[CommandCallback[CogT, ContextT, P2, U]], HybridCommand[CogT, P2, U]]:
         """A shortcut decorator that invokes :func:`~discord.ext.commands.hybrid_command` and adds it to
@@ -627,7 +813,7 @@ class HybridGroup(Group[CogT, P, T]):
 
         def decorator(func: CommandCallback[CogT, ContextT, P2, U]):
             kwargs.setdefault('parent', self)
-            result = hybrid_command(name=name, *args, **kwargs)(func)
+            result = hybrid_command(name=name, *args, with_app_command=with_app_command, **kwargs)(func)
             self.add_command(result)
             return result
 
@@ -635,8 +821,9 @@ class HybridGroup(Group[CogT, P, T]):
 
     def group(
         self,
-        name: str = MISSING,
+        name: Union[str, app_commands.locale_str] = MISSING,
         *args: Any,
+        with_app_command: bool = True,
         **kwargs: Any,
     ) -> Callable[[CommandCallback[CogT, ContextT, P2, U]], HybridGroup[CogT, P2, U]]:
         """A shortcut decorator that invokes :func:`~discord.ext.commands.hybrid_group` and adds it to
@@ -650,7 +837,7 @@ class HybridGroup(Group[CogT, P, T]):
 
         def decorator(func: CommandCallback[CogT, ContextT, P2, U]):
             kwargs.setdefault('parent', self)
-            result = hybrid_group(name=name, *args, **kwargs)(func)
+            result = hybrid_group(name=name, *args, with_app_command=with_app_command, **kwargs)(func)
             self.add_command(result)
             return result
 
@@ -658,10 +845,12 @@ class HybridGroup(Group[CogT, P, T]):
 
 
 def hybrid_command(
-    name: str = MISSING,
+    name: Union[str, app_commands.locale_str] = MISSING,
+    *,
+    with_app_command: bool = True,
     **attrs: Any,
 ) -> Callable[[CommandCallback[CogT, ContextT, P, T]], HybridCommand[CogT, P, T]]:
-    """A decorator that transforms a function into a :class:`.HybridCommand`.
+    r"""A decorator that transforms a function into a :class:`.HybridCommand`.
 
     A hybrid command is one that functions both as a regular :class:`.Command`
     and one that is also a :class:`app_commands.Command <discord.app_commands.Command>`.
@@ -683,12 +872,44 @@ def hybrid_command(
 
     Parameters
     -----------
-    name: :class:`str`
+    name: Union[:class:`str`, :class:`~discord.app_commands.locale_str`]
         The name to create the command with. By default this uses the
         function name unchanged.
-    attrs
+    with_app_command: :class:`bool`
+        Whether to register the command also as an application command.
+    \*\*attrs
         Keyword arguments to pass into the construction of the
         hybrid command.
+
+    Raises
+    -------
+    TypeError
+        If the function is not a coroutine or is already a command.
+    """
+
+    def decorator(func: CommandCallback[CogT, ContextT, P, T]) -> HybridCommand[CogT, P, T]:
+        if isinstance(func, Command):
+            raise TypeError('Callback is already a command.')
+        return HybridCommand(func, name=name, with_app_command=with_app_command, **attrs)  # type: ignore  # ???
+
+    return decorator
+
+
+def hybrid_group(
+    name: Union[str, app_commands.locale_str] = MISSING,
+    *,
+    with_app_command: bool = True,
+    **attrs: Any,
+) -> Callable[[CommandCallback[CogT, ContextT, P, T]], HybridGroup[CogT, P, T]]:
+    """A decorator that transforms a function into a :class:`.HybridGroup`.
+
+    This is similar to the :func:`~discord.ext.commands.group` decorator except it creates
+    a hybrid group instead.
+
+    Parameters
+    -----------
+    with_app_command: :class:`bool`
+        Whether to register the command also as an application command.
 
     Raises
     -------
@@ -699,24 +920,6 @@ def hybrid_command(
     def decorator(func: CommandCallback[CogT, ContextT, P, T]):
         if isinstance(func, Command):
             raise TypeError('Callback is already a command.')
-        return HybridCommand(func, name=name, **attrs)
-
-    return decorator
-
-
-def hybrid_group(
-    name: str = MISSING,
-    **attrs: Any,
-) -> Callable[[CommandCallback[CogT, ContextT, P, T]], HybridGroup[CogT, P, T]]:
-    """A decorator that transforms a function into a :class:`.HybridGroup`.
-
-    This is similar to the :func:`~discord.ext.commands.group` decorator except it creates
-    a hybrid group instead.
-    """
-
-    def decorator(func: CommandCallback[CogT, ContextT, P, T]):
-        if isinstance(func, Command):
-            raise TypeError('Callback is already a command.')
-        return HybridGroup(func, name=name, **attrs)
+        return HybridGroup(func, name=name, with_app_command=with_app_command, **attrs)
 
     return decorator  # type: ignore

@@ -27,8 +27,6 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
-import sys
-import traceback
 from typing import (
     Any,
     AsyncIterator,
@@ -117,6 +115,14 @@ class Client:
     r"""Represents a client connection that connects to Discord.
     This class is used to interact with the Discord WebSocket and API.
 
+    .. container:: operations
+
+        .. describe:: async with x
+
+            Asynchronously initialises the client and automatically cleans up.
+
+            .. versionadded:: 2.0
+
     A number of options can be passed to the :class:`Client`.
 
     Parameters
@@ -198,6 +204,14 @@ class Client:
         `aiohttp documentation <https://docs.aiohttp.org/en/stable/client_advanced.html#client-tracing>`_.
 
         .. versionadded:: 2.0
+    max_ratelimit_timeout: Optional[:class:`float`]
+        The maximum number of seconds to wait when a non-global rate limit is encountered.
+        If a request requires sleeping for more than the seconds passed in, then
+        :exc:`~discord.RateLimited` will be raised. By default, there is no timeout limit.
+        In order to prevent misuse and unnecessary bans, the minimum value this can be
+        set to is ``30.0`` seconds.
+
+        .. versionadded:: 2.0
 
     Attributes
     -----------
@@ -217,12 +231,14 @@ class Client:
         proxy_auth: Optional[aiohttp.BasicAuth] = options.pop('proxy_auth', None)
         unsync_clock: bool = options.pop('assume_unsync_clock', True)
         http_trace: Optional[aiohttp.TraceConfig] = options.pop('http_trace', None)
+        max_ratelimit_timeout: Optional[float] = options.pop('max_ratelimit_timeout', None)
         self.http: HTTPClient = HTTPClient(
             self.loop,
             proxy=proxy,
             proxy_auth=proxy_auth,
             unsync_clock=unsync_clock,
             http_trace=http_trace,
+            max_ratelimit_timeout=max_ratelimit_timeout,
         )
 
         self._handlers: Dict[str, Callable[..., None]] = {
@@ -238,6 +254,7 @@ class Client:
         self._connection.shard_count = self.shard_count
         self._closed: bool = False
         self._ready: asyncio.Event = MISSING
+        self._application: Optional[AppInfo] = None
         self._connection._get_websocket = self._get_websocket
         self._connection._get_client = lambda: self
 
@@ -296,18 +313,18 @@ class Client:
         return self._connection.user
 
     @property
-    def guilds(self) -> List[Guild]:
-        """List[:class:`.Guild`]: The guilds that the connected client is a member of."""
+    def guilds(self) -> Sequence[Guild]:
+        """Sequence[:class:`.Guild`]: The guilds that the connected client is a member of."""
         return self._connection.guilds
 
     @property
-    def emojis(self) -> List[Emoji]:
-        """List[:class:`.Emoji`]: The emojis that the connected client has."""
+    def emojis(self) -> Sequence[Emoji]:
+        """Sequence[:class:`.Emoji`]: The emojis that the connected client has."""
         return self._connection.emojis
 
     @property
-    def stickers(self) -> List[GuildSticker]:
-        """List[:class:`.GuildSticker`]: The stickers that the connected client has.
+    def stickers(self) -> Sequence[GuildSticker]:
+        """Sequence[:class:`.GuildSticker`]: The stickers that the connected client has.
 
         .. versionadded:: 2.0
         """
@@ -322,8 +339,8 @@ class Client:
         return utils.SequenceProxy(self._connection._messages or [])
 
     @property
-    def private_channels(self) -> List[PrivateChannel]:
-        """List[:class:`.abc.PrivateChannel`]: The private channels that the connected client is participating on.
+    def private_channels(self) -> Sequence[PrivateChannel]:
+        """Sequence[:class:`.abc.PrivateChannel`]: The private channels that the connected client is participating on.
 
         .. note::
 
@@ -345,8 +362,9 @@ class Client:
         """Optional[:class:`int`]: The client's application ID.
 
         If this is not passed via ``__init__`` then this is retrieved
-        through the gateway when an event contains the data. Usually
-        after :func:`~discord.on_connect` is called.
+        through the gateway when an event contains the data or after a call
+        to :meth:`~discord.Client.login`. Usually after :func:`~discord.on_connect`
+        is called.
 
         .. versionadded:: 2.0
         """
@@ -359,6 +377,22 @@ class Client:
         .. versionadded:: 2.0
         """
         return self._connection.application_flags
+
+    @property
+    def application(self) -> Optional[AppInfo]:
+        """Optional[:class:`~discord.AppInfo`]: The client's application info.
+
+        This is retrieved on :meth:`~discord.Client.login` and is not updated
+        afterwards. This allows populating the application_id without requiring a
+        gateway connection.
+
+        This is ``None`` if accessed before :meth:`~discord.Client.login` is called.
+
+        .. seealso:: The :meth:`~discord.Client.application_info` API call
+
+        .. versionadded:: 2.0
+        """
+        return self._application
 
     def is_ready(self) -> bool:
         """:class:`bool`: Specifies if the client's internal cache is ready for use."""
@@ -437,16 +471,16 @@ class Client:
 
         The default error handler provided by the client.
 
-        By default this prints to :data:`sys.stderr` however it could be
+        By default this logs to the library logger however it could be
         overridden to have a different implementation.
         Check :func:`~discord.on_error` for more details.
 
         .. versionchanged:: 2.0
 
-            ``event_method`` parameter is now positional-only.
+            ``event_method`` parameter is now positional-only
+            and instead of writing to ``sys.stderr`` it logs instead.
         """
-        print(f'Ignoring exception in {event_method}', file=sys.stderr)
-        traceback.print_exc()
+        _log.exception('Ignoring exception in %s', event_method)
 
     # hooks
 
@@ -484,7 +518,6 @@ class Client:
         self.loop = loop
         self.http.loop = loop
         self._connection.loop = loop
-        await self._connection.async_setup()
 
         self._ready = asyncio.Event()
 
@@ -540,8 +573,19 @@ class Client:
         if self.loop is _loop:
             await self._async_setup_hook()
 
-        data = await self.http.static_login(token.strip())
+        if not isinstance(token, str):
+            raise TypeError(f'expected token to be a str, received {token.__class__.__name__} instead')
+        token = token.strip()
+
+        data = await self.http.static_login(token)
         self._connection.user = ClientUser(state=self._connection, data=data)
+        self._application = await self.application_info()
+        if self._connection.application_id is None:
+            self._connection.application_id = self._application.id
+
+        if not self._connection.application_flags:
+            self._connection.application_flags = self._application.flags
+
         await self.setup_hook()
 
     async def connect(self, *, reconnect: bool = True) -> None:
@@ -582,9 +626,11 @@ class Client:
                 while True:
                     await self.ws.poll_event()
             except ReconnectWebSocket as e:
-                _log.info('Got a request to %s the websocket.', e.op)
+                _log.debug('Got a request to %s the websocket.', e.op)
                 self.dispatch('disconnect')
                 ws_params.update(sequence=self.ws.sequence, resume=e.resume, session=self.ws.session_id)
+                if e.resume:
+                    ws_params['gateway'] = self.ws.gateway
                 continue
             except (
                 OSError,
@@ -608,7 +654,13 @@ class Client:
 
                 # If we get connection reset by peer then try to RESUME
                 if isinstance(exc, OSError) and exc.errno in (54, 10054):
-                    ws_params.update(sequence=self.ws.sequence, initial=False, resume=True, session=self.ws.session_id)
+                    ws_params.update(
+                        sequence=self.ws.sequence,
+                        gateway=self.ws.gateway,
+                        initial=False,
+                        resume=True,
+                        session=self.ws.session_id,
+                    )
                     continue
 
                 # We should only get this when an unhandled close code happens,
@@ -628,7 +680,12 @@ class Client:
                 # Always try to RESUME the connection
                 # If the connection is not RESUME-able then the gateway will invalidate the session.
                 # This is apparently what the official Discord client does.
-                ws_params.update(sequence=self.ws.sequence, resume=True, session=self.ws.session_id)
+                ws_params.update(
+                    sequence=self.ws.sequence,
+                    gateway=self.ws.gateway,
+                    resume=True,
+                    session=self.ws.session_id,
+                )
 
     async def close(self) -> None:
         """|coro|
@@ -640,12 +697,7 @@ class Client:
 
         self._closed = True
 
-        for voice in self.voice_clients:
-            try:
-                await voice.disconnect(force=True)
-            except Exception:
-                # if an error happens during disconnects, disregard it.
-                pass
+        await self._connection.close()
 
         if self.ws is not None and self.ws.open:
             await self.ws.close(code=1000)
@@ -667,12 +719,23 @@ class Client:
         self._closed = False
         self._ready.clear()
         self._connection.clear()
-        self.http.recreate()
+        self.http.clear()
 
     async def start(self, token: str, *, reconnect: bool = True) -> None:
         """|coro|
 
         A shorthand coroutine for :meth:`login` + :meth:`connect`.
+
+        Parameters
+        -----------
+        token: :class:`str`
+            The authentication token. Do not prefix this token with
+            anything as the library will do it for you.
+        reconnect: :class:`bool`
+            If we should attempt reconnecting, either due to internet
+            failure or a specific failure on Discord's part. Certain
+            disconnects that lead to bad state will not be handled (such as
+            invalid sharding payloads or bad tokens).
 
         Raises
         -------
@@ -682,7 +745,16 @@ class Client:
         await self.login(token)
         await self.connect(reconnect=reconnect)
 
-    def run(self, *args: Any, **kwargs: Any) -> None:
+    def run(
+        self,
+        token: str,
+        *,
+        reconnect: bool = True,
+        log_handler: Optional[logging.Handler] = MISSING,
+        log_formatter: logging.Formatter = MISSING,
+        log_level: int = MISSING,
+        root_logger: bool = False,
+    ) -> None:
         """A blocking call that abstracts away the event loop
         initialisation from you.
 
@@ -690,23 +762,67 @@ class Client:
         function should not be used. Use :meth:`start` coroutine
         or :meth:`connect` + :meth:`login`.
 
-        Roughly Equivalent to: ::
-
-            try:
-                asyncio.run(self.start(*args, **kwargs))
-            except KeyboardInterrupt:
-                return
+        This function also sets up the logging library to make it easier
+        for beginners to know what is going on with the library. For more
+        advanced users, this can be disabled by passing ``None`` to
+        the ``log_handler`` parameter.
 
         .. warning::
 
             This function must be the last function to call due to the fact that it
             is blocking. That means that registration of events or anything being
             called after this function call will not execute until it returns.
+
+        Parameters
+        -----------
+        token: :class:`str`
+            The authentication token. Do not prefix this token with
+            anything as the library will do it for you.
+        reconnect: :class:`bool`
+            If we should attempt reconnecting, either due to internet
+            failure or a specific failure on Discord's part. Certain
+            disconnects that lead to bad state will not be handled (such as
+            invalid sharding payloads or bad tokens).
+        log_handler: Optional[:class:`logging.Handler`]
+            The log handler to use for the library's logger. If this is ``None``
+            then the library will not set up anything logging related. Logging
+            will still work if ``None`` is passed, though it is your responsibility
+            to set it up.
+
+            The default log handler if not provided is :class:`logging.StreamHandler`.
+
+            .. versionadded:: 2.0
+        log_formatter: :class:`logging.Formatter`
+            The formatter to use with the given log handler. If not provided then it
+            defaults to a colour based logging formatter (if available).
+
+            .. versionadded:: 2.0
+        log_level: :class:`int`
+            The default log level for the library's logger. This is only applied if the
+            ``log_handler`` parameter is not ``None``. Defaults to ``logging.INFO``.
+
+            .. versionadded:: 2.0
+        root_logger: :class:`bool`
+            Whether to set up the root logger rather than the library logger.
+            By default, only the library logger (``'discord'``) is set up. If this
+            is set to ``True`` then the root logger is set up as well.
+
+            Defaults to ``False``.
+
+            .. versionadded:: 2.0
         """
 
         async def runner():
             async with self:
-                await self.start(*args, **kwargs)
+                await self.start(token, reconnect=reconnect)
+
+        if log_handler is not None:
+            utils.setup_logging(
+                handler=log_handler,
+                formatter=log_formatter,
+                level=log_level,
+                root=root_logger,
+            )
 
         try:
             asyncio.run(runner())
@@ -772,7 +888,7 @@ class Client:
         if value is None or isinstance(value, AllowedMentions):
             self._connection.allowed_mentions = value
         else:
-            raise TypeError(f'allowed_mentions must be AllowedMentions not {value.__class__!r}')
+            raise TypeError(f'allowed_mentions must be AllowedMentions not {value.__class__.__name__}')
 
     @property
     def intents(self) -> Intents:
@@ -808,7 +924,9 @@ class Client:
         """
         return self._connection.get_channel(id)  # type: ignore # The cache contains all channel types
 
-    def get_partial_messageable(self, id: int, *, type: Optional[ChannelType] = None) -> PartialMessageable:
+    def get_partial_messageable(
+        self, id: int, *, guild_id: Optional[int] = None, type: Optional[ChannelType] = None
+    ) -> PartialMessageable:
         """Returns a partial messageable with the given channel ID.
 
         This is useful if you have a channel_id but don't want to do an API call
@@ -820,6 +938,12 @@ class Client:
         -----------
         id: :class:`int`
             The channel ID to create a partial messageable for.
+        guild_id: Optional[:class:`int`]
+            The optional guild ID to create a partial messageable for.
+
+            This is not required to actually send messages, but it does allow the
+            :meth:`~discord.PartialMessageable.jump_url` and
+            :attr:`~discord.PartialMessageable.guild` properties to function properly.
         type: Optional[:class:`.ChannelType`]
             The underlying channel type for the partial messageable.
 
@@ -828,7 +952,7 @@ class Client:
         :class:`.PartialMessageable`
             The partial messageable
         """
-        return PartialMessageable(state=self._connection, id=id, type=type)
+        return PartialMessageable(state=self._connection, id=id, guild_id=guild_id, type=type)
 
     def get_stage_instance(self, id: int, /) -> Optional[StageInstance]:
         """Returns a stage instance with the given stage channel ID.
@@ -980,6 +1104,11 @@ class Client:
         """
         if self._ready is not MISSING:
             await self._ready.wait()
+        else:
+            raise RuntimeError(
+                'Client has not been properly initialised. '
+                'Please use the login method or asynchronous context manager before calling this method'
+            )
 
     def wait_for(
         self,
@@ -1256,7 +1385,7 @@ class Client:
             The guild with the guild data parsed.
         """
 
-        async def _before_strategy(retrieve, before, limit):
+        async def _before_strategy(retrieve: int, before: Optional[Snowflake], limit: Optional[int]):
             before_id = before.id if before else None
             data = await self.http.get_guilds(retrieve, before=before_id)
 
@@ -1268,7 +1397,7 @@ class Client:
 
             return data, before, limit
 
-        async def _after_strategy(retrieve, after, limit):
+        async def _after_strategy(retrieve: int, after: Optional[Snowflake], limit: Optional[int]):
             after_id = after.id if after else None
             data = await self.http.get_guilds(retrieve, after=after_id)
 
@@ -1545,7 +1674,7 @@ class Client:
 
         Revokes an :class:`.Invite`, URL, or ID to an invite.
 
-        You must have the :attr:`~.Permissions.manage_channels` permission in
+        You must have :attr:`~.Permissions.manage_channels` in
         the associated guild to do this.
 
         .. versionchanged:: 2.0
@@ -1704,8 +1833,8 @@ class Client:
         else:
             # the factory can't be a DMChannel or GroupChannel here
             guild_id = int(data['guild_id'])  # type: ignore
-            guild = self.get_guild(guild_id) or Object(id=guild_id)
-            # GuildChannels expect a Guild, we may be passing an Object
+            guild = self._connection._get_or_create_unavailable_guild(guild_id)
+            # the factory should be a GuildChannel or Thread
             channel = factory(guild=guild, state=self._connection, data=data)  # type: ignore
 
         return channel
@@ -1835,7 +1964,7 @@ class Client:
         """
 
         if not isinstance(view, View):
-            raise TypeError(f'expected an instance of View not {view.__class__!r}')
+            raise TypeError(f'expected an instance of View not {view.__class__.__name__}')
 
         if not view.is_persistent():
             raise ValueError('View is not persistent. Items need to have a custom_id set and View must have no timeout')

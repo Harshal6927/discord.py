@@ -24,17 +24,18 @@ DEALINGS IN THE SOFTWARE.
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar, Union, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Generator, Generic, List, Optional, TypeVar, Union, Sequence, Type
 
 import discord.abc
 import discord.utils
-from discord import Interaction, Message, Attachment, MessageType, User, PartialMessageable
+from discord import Interaction, Message, Attachment, MessageType, User, PartialMessageable, Permissions, ChannelType, Thread
+from discord.context_managers import Typing
 from .view import StringView
 
 from ._types import BotT
 
 if TYPE_CHECKING:
-    from typing_extensions import Self, ParamSpec
+    from typing_extensions import Self, ParamSpec, TypeGuard
 
     from discord.abc import MessageableChannel
     from discord.guild import Guild
@@ -54,6 +55,10 @@ if TYPE_CHECKING:
     from .core import Command
     from .parameters import Parameter
 
+    from types import TracebackType
+
+    BE = TypeVar('BE', bound=BaseException)
+
 # fmt: off
 __all__ = (
     'Context',
@@ -70,6 +75,30 @@ if TYPE_CHECKING:
     P = ParamSpec('P')
 else:
     P = TypeVar('P')
+
+
+def is_cog(obj: Any) -> TypeGuard[Cog]:
+    return hasattr(obj, '__cog_commands__')
+
+
+class DeferTyping:
+    def __init__(self, ctx: Context[BotT], *, ephemeral: bool):
+        self.ctx: Context[BotT] = ctx
+        self.ephemeral: bool = ephemeral
+
+    def __await__(self) -> Generator[Any, None, None]:
+        return self.ctx.defer(ephemeral=self.ephemeral).__await__()
+
+    async def __aenter__(self) -> None:
+        await self.ctx.defer(ephemeral=self.ephemeral)
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BE]],
+        exc: Optional[BE],
+        traceback: Optional[TracebackType],
+    ) -> None:
+        pass
 
 
 class Context(discord.abc.Messageable, Generic[BotT]):
@@ -244,7 +273,9 @@ class Context(discord.abc.Messageable, Generic[BotT]):
             if interaction.channel_id is None:
                 raise RuntimeError('interaction channel ID is null, this is probably a Discord bug')
 
-            channel = interaction.channel or PartialMessageable(state=interaction._state, id=interaction.channel_id)
+            channel = interaction.channel or PartialMessageable(
+                state=interaction._state, guild_id=interaction.guild_id, id=interaction.channel_id
+            )
             message = Message(state=interaction._state, channel=channel, data=synthetic_payload)  # type: ignore
             message.author = interaction.user
             message.attachments = [a for _, a in interaction.namespace if isinstance(a, Attachment)]
@@ -252,7 +283,7 @@ class Context(discord.abc.Messageable, Generic[BotT]):
             message = interaction.message
 
         prefix = '/' if data.get('type', 1) == 1 else '\u200b'  # Mock the prefix
-        return cls(
+        ctx = cls(
             message=message,
             bot=bot,
             view=StringView(''),
@@ -263,6 +294,9 @@ class Context(discord.abc.Messageable, Generic[BotT]):
             invoked_with=command.name,
             command=command,  # type: ignore # this will be a hybrid command, technically
         )
+        interaction._baton = ctx
+        ctx.command_failed = interaction.command_failed
+        return ctx
 
     async def invoke(self, command: Command[CogT, P, T], /, *args: P.args, **kwargs: P.kwargs) -> T:
         r"""|coro|
@@ -423,6 +457,76 @@ class Context(discord.abc.Messageable, Generic[BotT]):
         # bot.user will never be None at this point.
         return self.guild.me if self.guild is not None else self.bot.user  # type: ignore
 
+    @discord.utils.cached_property
+    def permissions(self) -> Permissions:
+        """:class:`.Permissions`: Returns the resolved permissions for the invoking user in this channel.
+        Shorthand for :meth:`.abc.GuildChannel.permissions_for` or :attr:`.Interaction.permissions`.
+
+        .. versionadded:: 2.0
+        """
+        if self.channel.type is ChannelType.private:
+            return Permissions._dm_permissions()
+        if not self.interaction:
+            # channel and author will always match relevant types here
+            return self.channel.permissions_for(self.author)  # type: ignore
+        base = self.interaction.permissions
+        if self.channel.type in (ChannelType.voice, ChannelType.stage_voice):
+            if not base.connect:
+                # voice channels cannot be edited by people who can't connect to them
+                # It also implicitly denies all other voice perms
+                denied = Permissions.voice()
+                denied.update(manage_channels=True, manage_roles=True)
+                base.value &= ~denied.value
+        else:
+            # text channels do not have voice related permissions
+            denied = Permissions.voice()
+            base.value &= ~denied.value
+        return base
+
+    @discord.utils.cached_property
+    def bot_permissions(self) -> Permissions:
+        """:class:`.Permissions`: Returns the resolved permissions for the bot in this channel.
+        Shorthand for :meth:`.abc.GuildChannel.permissions_for` or :attr:`.Interaction.app_permissions`.
+
+        For interaction-based commands, this will reflect the effective permissions
+        for :class:`Context` calls, which may differ from calls through
+        other :class:`.abc.Messageable` endpoints, like :attr:`channel`.
+
+        Notably, sending messages, embedding links, and attaching files are always
+        permitted, while reading messages might not be.
+
+        .. versionadded:: 2.0
+        """
+        channel = self.channel
+        if channel.type == ChannelType.private:
+            return Permissions._dm_permissions()
+        if not self.interaction:
+            # channel and me will always match relevant types here
+            return channel.permissions_for(self.me)  # type: ignore
+        guild = channel.guild
+        base = self.interaction.app_permissions
+        if self.channel.type in (ChannelType.voice, ChannelType.stage_voice):
+            if not base.connect:
+                # voice channels cannot be edited by people who can't connect to them
+                # It also implicitly denies all other voice perms
+                denied = Permissions.voice()
+                denied.update(manage_channels=True, manage_roles=True)
+                base.value &= ~denied.value
+        else:
+            # text channels do not have voice related permissions
+            denied = Permissions.voice()
+            base.value &= ~denied.value
+        base.update(
+            embed_links=True,
+            attach_files=True,
+            send_tts_messages=False,
+        )
+        if isinstance(channel, Thread):
+            base.send_messages_in_threads = True
+        else:
+            base.send_messages = True
+        return base
+
     @property
     def voice_client(self) -> Optional[VoiceProtocol]:
         r"""Optional[:class:`.VoiceProtocol`]: A shortcut to :attr:`.Guild.voice_client`\, if applicable."""
@@ -447,7 +551,7 @@ class Context(discord.abc.Messageable, Generic[BotT]):
 
             Due to the way this function works, instead of returning
             something similar to :meth:`~.commands.HelpCommand.command_not_found`
-            this returns :class:`None` on bad input or no help command.
+            this returns ``None`` on bad input or no help command.
 
         Parameters
         ------------
@@ -497,7 +601,7 @@ class Context(discord.abc.Messageable, Generic[BotT]):
         await cmd.prepare_help_command(self, entity.qualified_name)
 
         try:
-            if hasattr(entity, '__cog_commands__'):
+            if is_cog(entity):
                 injected = wrap_callback(cmd.send_cog_help)
                 return await injected(entity)
             elif isinstance(entity, Group):
@@ -545,6 +649,46 @@ class Context(discord.abc.Messageable, Generic[BotT]):
             return await self.send(content, reference=self.message, **kwargs)
         else:
             return await self.send(content, **kwargs)
+
+    def typing(self, *, ephemeral: bool = False) -> Union[Typing, DeferTyping]:
+        """Returns an asynchronous context manager that allows you to send a typing indicator to
+        the destination for an indefinite period of time, or 10 seconds if the context manager
+        is called using ``await``.
+
+        In an interaction based context, this is equivalent to a :meth:`defer` call and
+        does not do any typing calls.
+
+        Example Usage: ::
+
+            async with channel.typing():
+                # simulate something heavy
+                await asyncio.sleep(20)
+
+            await channel.send('Done!')
+
+        Example Usage: ::
+
+            await channel.typing()
+            # Do some computational magic for about 10 seconds
+            await channel.send('Done!')
+
+        .. versionchanged:: 2.0
+            This no longer works with the ``with`` syntax, ``async with`` must be used instead.
+
+        .. versionchanged:: 2.0
+            Added functionality to ``await`` the context manager to send a typing indicator for 10 seconds.
+
+        Parameters
+        -----------
+        ephemeral: :class:`bool`
+            Indicates whether the deferred message will eventually be ephemeral.
+            Only valid for interaction based contexts.
+
+            .. versionadded:: 2.0
+        """
+        if self.interaction is None:
+            return Typing(self)
+        return DeferTyping(self, ephemeral=ephemeral)
 
     async def defer(self, *, ephemeral: bool = False) -> None:
         """|coro|
@@ -730,7 +874,7 @@ class Context(discord.abc.Messageable, Generic[BotT]):
             msg = await self.interaction.followup.send(**kwargs, wait=True)
         else:
             await self.interaction.response.send_message(**kwargs)
-            msg = await self.interaction.original_message()
+            msg = await self.interaction.original_response()
 
         if delete_after is not None and not (ephemeral and self.interaction is not None):
             await msg.delete(delay=delete_after)

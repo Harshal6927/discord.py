@@ -23,7 +23,8 @@ DEALINGS IN THE SOFTWARE.
 """
 
 from __future__ import annotations
-from typing import List, Optional, TYPE_CHECKING, Tuple, TypeVar, Callable, Union
+from typing import List, Literal, Optional, TYPE_CHECKING, Tuple, TypeVar, Callable, Union, Dict
+from contextvars import ContextVar
 import inspect
 import os
 
@@ -53,6 +54,8 @@ if TYPE_CHECKING:
 
 V = TypeVar('V', bound='View', covariant=True)
 
+selected_values: ContextVar[Dict[str, List[str]]] = ContextVar('selected_values')
+
 
 class Select(Item[V]):
     """Represents a UI select menu.
@@ -72,7 +75,7 @@ class Select(Item[V]):
         The placeholder text that is shown if nothing is selected, if any.
     min_values: :class:`int`
         The minimum number of items that must be chosen for this select menu.
-        Defaults to 1 and must be between 1 and 25.
+        Defaults to 1 and must be between 0 and 25.
     max_values: :class:`int`
         The maximum number of items that must be chosen for this select menu.
         Defaults to 1 and must be between 1 and 25.
@@ -108,16 +111,14 @@ class Select(Item[V]):
         row: Optional[int] = None,
     ) -> None:
         super().__init__()
-        self._selected_values: List[str] = []
         self._provided_custom_id = custom_id is not MISSING
         custom_id = os.urandom(16).hex() if custom_id is MISSING else custom_id
         if not isinstance(custom_id, str):
-            raise TypeError(f'expected custom_id to be str not {custom_id.__class__!r}')
+            raise TypeError(f'expected custom_id to be str not {custom_id.__class__.__name__}')
 
         options = [] if options is MISSING else options
         self._underlying = SelectMenu._raw_construct(
             custom_id=custom_id,
-            type=ComponentType.select,
             placeholder=placeholder,
             min_values=min_values,
             max_values=max_values,
@@ -125,6 +126,7 @@ class Select(Item[V]):
             disabled=disabled,
         )
         self.row = row
+        self._values: List[str] = []
 
     @property
     def custom_id(self) -> str:
@@ -137,6 +139,7 @@ class Select(Item[V]):
             raise TypeError('custom_id must be None or str')
 
         self._underlying.custom_id = value
+        self._provided_custom_id = value is not None
 
     @property
     def placeholder(self) -> Optional[str]:
@@ -260,7 +263,8 @@ class Select(Item[V]):
     @property
     def values(self) -> List[str]:
         """List[:class:`str`]: A list of values that have been selected by the user."""
-        return self._selected_values
+        values = selected_values.get({})
+        return values.get(self.custom_id, self._values)
 
     @property
     def width(self) -> int:
@@ -273,7 +277,9 @@ class Select(Item[V]):
         self._underlying = component
 
     def _refresh_state(self, data: MessageComponentInteractionData) -> None:
-        self._selected_values = data.get('values', [])
+        values = selected_values.get({})
+        self._values = values[self.custom_id] = data.get('values', [])
+        selected_values.set(values)
 
     @classmethod
     def from_component(cls, component: SelectMenu) -> Self:
@@ -288,7 +294,7 @@ class Select(Item[V]):
         )
 
     @property
-    def type(self) -> ComponentType:
+    def type(self) -> Literal[ComponentType.select]:
         return self._underlying.type
 
     def is_dispatchable(self) -> bool:
@@ -329,7 +335,7 @@ def select(
         ordering. The row number must be between 0 and 4 (i.e. zero indexed).
     min_values: :class:`int`
         The minimum number of items that must be chosen for this select menu.
-        Defaults to 1 and must be between 1 and 25.
+        Defaults to 1 and must be between 0 and 25.
     max_values: :class:`int`
         The maximum number of items that must be chosen for this select menu.
         Defaults to 1 and must be between 1 and 25.

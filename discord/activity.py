@@ -196,7 +196,6 @@ class Activity(BaseActivity):
     __slots__ = (
         'state',
         'details',
-        '_created_at',
         'timestamps',
         'assets',
         'party',
@@ -405,13 +404,11 @@ class Game(BaseActivity):
         if self._end:
             timestamps['end'] = self._end
 
-        # fmt: off
         return {
             'type': ActivityType.playing.value,
             'name': str(self.name),
-            'timestamps': timestamps
+            'timestamps': timestamps,
         }
-        # fmt: on
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, Game) and other.name == self.name
@@ -509,14 +506,12 @@ class Streaming(BaseActivity):
             return name[7:] if name[:7] == 'twitch:' else None
 
     def to_dict(self) -> Dict[str, Any]:
-        # fmt: off
         ret: Dict[str, Any] = {
             'type': ActivityType.streaming.value,
             'name': str(self.name),
             'url': str(self.url),
-            'assets': self.assets
+            'assets': self.assets,
         }
-        # fmt: on
         if self.details:
             ret['details'] = self.details
         return ret
@@ -826,7 +821,7 @@ def create_activity(data: Optional[ActivityPayload], state: ConnectionState) -> 
         return Game(**data)
     elif game_type is ActivityType.custom:
         try:
-            name = data.pop('name')
+            name = data.pop('name')  # type: ignore
         except KeyError:
             ret = Activity(**data)
         else:

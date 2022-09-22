@@ -347,7 +347,7 @@ class Role(Hashable):
     @property
     def members(self) -> List[Member]:
         """List[:class:`Member`]: Returns all the members with this role."""
-        all_members = self.guild.members
+        all_members = list(self.guild._members.values())
         if self.is_default():
             return all_members
 
@@ -394,8 +394,7 @@ class Role(Hashable):
 
         Edits the role.
 
-        You must have the :attr:`~Permissions.manage_roles` permission to
-        use this.
+        You must have :attr:`~Permissions.manage_roles` to do this.
 
         All fields are optional.
 
@@ -492,8 +491,7 @@ class Role(Hashable):
 
         Deletes the role.
 
-        You must have the :attr:`~Permissions.manage_roles` permission to
-        use this.
+        You must have :attr:`~Permissions.manage_roles` to do this.
 
         Parameters
         -----------

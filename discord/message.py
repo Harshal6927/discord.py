@@ -45,6 +45,7 @@ from typing import (
 )
 
 from . import utils
+from .asset import Asset
 from .reaction import Reaction
 from .emoji import Emoji
 from .partial_emoji import PartialEmoji
@@ -87,7 +88,7 @@ if TYPE_CHECKING:
     from .types.gateway import MessageReactionRemoveEvent, MessageUpdateEvent
     from .abc import Snowflake
     from .abc import GuildChannel, MessageableChannel
-    from .components import Component
+    from .components import ActionRow, ActionRowChildComponentType
     from .state import ConnectionState
     from .channel import TextChannel
     from .mentions import AllowedMentions
@@ -96,6 +97,7 @@ if TYPE_CHECKING:
     from .ui.view import View
 
     EmojiInputType = Union[Emoji, PartialEmoji, str]
+    MessageComponentType = Union[ActionRow, ActionRowChildComponentType]
 
 
 __all__ = (
@@ -105,6 +107,7 @@ __all__ = (
     'MessageInteraction',
     'MessageReference',
     'DeletedReferencedMessage',
+    'MessageApplication',
 )
 
 
@@ -467,7 +470,7 @@ class MessageReference:
     def with_state(cls, state: ConnectionState, data: MessageReferencePayload) -> Self:
         self = cls.__new__(cls)
         self.message_id = utils._get_as_snowflake(data, 'message_id')
-        self.channel_id = int(data.pop('channel_id'))
+        self.channel_id = int(data['channel_id'])
         self.guild_id = utils._get_as_snowflake(data, 'guild_id')
         self.fail_if_not_exists = data.get('fail_if_not_exists', True)
         self._state = state
@@ -609,6 +612,51 @@ def flatten_handlers(cls: Type[Message]) -> Type[Message]:
     return cls
 
 
+class MessageApplication:
+    """Represents a message's application data from a :class:`~discord.Message`.
+
+    .. versionadded:: 2.0
+
+    Attributes
+    -----------
+    id: :class:`int`
+        The application ID.
+    description: :class:`str`
+        The application description.
+    name: :class:`str`
+        The application's name.
+    """
+
+    __slots__ = ('_state', '_icon', '_cover_image', 'id', 'description', 'name')
+
+    def __init__(self, *, state: ConnectionState, data: MessageApplicationPayload) -> None:
+        self._state: ConnectionState = state
+        self.id: int = int(data['id'])
+        self.description: str = data['description']
+        self.name: str = data['name']
+        self._icon: Optional[str] = data['icon']
+        self._cover_image: Optional[str] = data.get('cover_image')
+
+    def __repr__(self) -> str:
+        return f'<MessageApplication id={self.id} name={self.name!r}>'
+
+    @property
+    def icon(self) -> Optional[Asset]:
+        """Optional[:class:`Asset`]: The application's icon, if any."""
+        if self._icon:
+            return Asset._from_app_icon(state=self._state, object_id=self.id, icon_hash=self._icon, asset_type='icon')
+        return None
+
+    @property
+    def cover(self) -> Optional[Asset]:
+        """Optional[:class:`Asset`]: The application's cover image, if any."""
+        if self._cover_image:
+            return Asset._from_app_icon(
+                state=self._state, object_id=self.id, icon_hash=self._cover_image, asset_type='cover_image'
+            )
+        return None
+
+
 class PartialMessage(Hashable):
     """Represents a partial message to aid with working messages when only
     a message and channel ID are present.
@@ -723,8 +771,7 @@ class PartialMessage(Hashable):
         Deletes the message.
 
         Your own messages could be deleted without any proper permissions. However to
-        delete other people's messages, you need the :attr:`~Permissions.manage_messages`
-        permission.
+        delete other people's messages, you must have :attr:`~Permissions.manage_messages`.
 
         .. versionchanged:: 1.1
             Added the new ``delay`` keyword-only parameter.
@@ -785,6 +832,7 @@ class PartialMessage(Hashable):
 
     async def edit(
         self,
+        *,
         content: Optional[str] = MISSING,
         embed: Optional[Embed] = MISSING,
         embeds: Sequence[Embed] = MISSING,
@@ -882,7 +930,11 @@ class PartialMessage(Hashable):
         message = Message(state=self._state, channel=self.channel, data=data)
 
         if view and not view.is_finished():
-            self._state.store_view(view, self.id)
+            interaction: Optional[MessageInteraction] = getattr(self, 'interaction', None)
+            if interaction is not None:
+                self._state.store_view(view, self.id, interaction_id=interaction.id)
+            else:
+                self._state.store_view(view, self.id)
 
         if delete_after is not None:
             await self.delete(delay=delete_after)
@@ -894,10 +946,10 @@ class PartialMessage(Hashable):
 
         Publishes this message to your announcement channel.
 
-        You must have the :attr:`~Permissions.send_messages` permission to do this.
+        You must have :attr:`~Permissions.send_messages` to do this.
 
-        If the message is not your own then the :attr:`~Permissions.manage_messages`
-        permission is also needed.
+        If the message is not your own then :attr:`~Permissions.manage_messages`
+        is also needed.
 
         Raises
         -------
@@ -914,7 +966,7 @@ class PartialMessage(Hashable):
 
         Pins the message.
 
-        You must have the :attr:`~Permissions.manage_messages` permission to do
+        You must have :attr:`~Permissions.manage_messages` to do
         this in a non-private channel context.
 
         Parameters
@@ -944,7 +996,7 @@ class PartialMessage(Hashable):
 
         Unpins the message.
 
-        You must have the :attr:`~Permissions.manage_messages` permission to do
+        You must have :attr:`~Permissions.manage_messages` to do
         this in a non-private channel context.
 
         Parameters
@@ -968,16 +1020,16 @@ class PartialMessage(Hashable):
         # pinned exists on PartialMessage for duck typing purposes
         self.pinned = False
 
-    async def add_reaction(self, emoji: EmojiInputType, /) -> None:
+    async def add_reaction(self, emoji: Union[EmojiInputType, Reaction], /) -> None:
         """|coro|
 
         Adds a reaction to the message.
 
         The emoji may be a unicode emoji or a custom guild :class:`Emoji`.
 
-        You must have the :attr:`~Permissions.read_message_history` permission
-        to use this. If nobody else has reacted to the message using this
-        emoji, the :attr:`~Permissions.add_reactions` permission is required.
+        You must have :attr:`~Permissions.read_message_history`
+        to do this. If nobody else has reacted to the message using this
+        emoji, :attr:`~Permissions.add_reactions` is required.
 
         .. versionchanged:: 2.0
 
@@ -1015,7 +1067,7 @@ class PartialMessage(Hashable):
         The emoji may be a unicode emoji or a custom guild :class:`Emoji`.
 
         If the reaction is not your own (i.e. ``member`` parameter is not you) then
-        the :attr:`~Permissions.manage_messages` permission is needed.
+        :attr:`~Permissions.manage_messages` is needed.
 
         The ``member`` parameter must represent a member and meet
         the :class:`abc.Snowflake` abc.
@@ -1057,7 +1109,7 @@ class PartialMessage(Hashable):
 
         The emoji may be a unicode emoji or a custom guild :class:`Emoji`.
 
-        You need the :attr:`~Permissions.manage_messages` permission to use this.
+        You must have :attr:`~Permissions.manage_messages` to do this.
 
         .. versionadded:: 1.3
 
@@ -1090,7 +1142,7 @@ class PartialMessage(Hashable):
 
         Removes all the reactions from the message.
 
-        You need the :attr:`~Permissions.manage_messages` permission to use this.
+        You must have :attr:`~Permissions.manage_messages` to do this.
 
         Raises
         --------
@@ -1258,11 +1310,15 @@ class Message(PartialMessage, Hashable):
         private channel or the user has the left the guild, then it is a :class:`User` instead.
     content: :class:`str`
         The actual contents of the message.
+        If :attr:`Intents.message_content` is not enabled this will always be an empty string
+        unless the bot is mentioned or the message is a direct message.
     nonce: Optional[Union[:class:`str`, :class:`int`]]
         The value used by the discord guild and the client to verify that the message is successfully sent.
         This is not stored long term within Discord's servers and is only used ephemerally.
     embeds: List[:class:`Embed`]
         A list of embeds the message has.
+        If :attr:`Intents.message_content` is not enabled this will always be an empty list
+        unless the bot is mentioned or the message is a direct message.
     channel: Union[:class:`TextChannel`, :class:`VoiceChannel`, :class:`Thread`, :class:`DMChannel`, :class:`GroupChannel`, :class:`PartialMessageable`]
         The :class:`TextChannel` or :class:`Thread` that the message was sent from.
         Could be a :class:`DMChannel` or :class:`GroupChannel` if it's a private message.
@@ -1304,6 +1360,8 @@ class Message(PartialMessage, Hashable):
         message.
     attachments: List[:class:`Attachment`]
         A list of attachments given to a message.
+        If :attr:`Intents.message_content` is not enabled this will always be an empty list
+        unless the bot is mentioned or the message is a direct message.
     pinned: :class:`bool`
         Specifies if the message is currently pinned.
     flags: :class:`MessageFlags`
@@ -1321,22 +1379,20 @@ class Message(PartialMessage, Hashable):
 
         - ``type``: An integer denoting the type of message activity being requested.
         - ``party_id``: The party ID associated with the party.
-    application: Optional[:class:`dict`]
+    application: Optional[:class:`~discord.MessageApplication`]
         The rich presence enabled application associated with this message.
 
-        It is a dictionary with the following keys:
+        .. versionchanged:: 2.0
+            Type is now :class:`MessageApplication` instead of :class:`dict`.
 
-        - ``id``: A string representing the application's ID.
-        - ``name``: A string representing the application's name.
-        - ``description``: A string representing the application's description.
-        - ``icon``: A string representing the icon ID of the application.
-        - ``cover_image``: A string representing the embed's image asset ID.
     stickers: List[:class:`StickerItem`]
         A list of sticker items given to the message.
 
         .. versionadded:: 1.6
-    components: List[:class:`Component`]
+    components: List[Union[:class:`ActionRow`, :class:`Button`, :class:`SelectMenu`]]
         A list of components in the message.
+        If :attr:`Intents.message_content` is not enabled this will always be an empty list
+        unless the bot is mentioned or the message is a direct message.
 
         .. versionadded:: 2.0
     interaction: Optional[:class:`MessageInteraction`]
@@ -1348,7 +1404,6 @@ class Message(PartialMessage, Hashable):
     """
 
     __slots__ = (
-        '_state',
         '_edited_timestamp',
         '_cs_channel_mentions',
         '_cs_raw_mentions',
@@ -1358,7 +1413,6 @@ class Message(PartialMessage, Hashable):
         '_cs_system_content',
         'tts',
         'content',
-        'channel',
         'webhook_id',
         'mention_everyone',
         'embeds',
@@ -1387,6 +1441,7 @@ class Message(PartialMessage, Hashable):
         mentions: List[Union[User, Member]]
         author: Union[User, Member]
         role_mentions: List[Role]
+        components: List[MessageComponentType]
 
     def __init__(
         self,
@@ -1402,9 +1457,7 @@ class Message(PartialMessage, Hashable):
         self.reactions: List[Reaction] = [Reaction(message=self, data=d) for d in data.get('reactions', [])]
         self.attachments: List[Attachment] = [Attachment(data=a, state=self._state) for a in data['attachments']]
         self.embeds: List[Embed] = [Embed.from_dict(a) for a in data['embeds']]
-        self.application: Optional[MessageApplicationPayload] = data.get('application')
         self.activity: Optional[MessageActivityPayload] = data.get('activity')
-        self.channel: MessageableChannel = channel
         self._edited_timestamp: Optional[datetime.datetime] = utils.parse_time(data['edited_timestamp'])
         self.type: MessageType = try_enum(MessageType, data['type'])
         self.pinned: bool = data['pinned']
@@ -1414,11 +1467,10 @@ class Message(PartialMessage, Hashable):
         self.content: str = data['content']
         self.nonce: Optional[Union[int, str]] = data.get('nonce')
         self.stickers: List[StickerItem] = [StickerItem(data=d, state=state) for d in data.get('sticker_items', [])]
-        self.components: List[Component] = [_component_factory(d) for d in data.get('components', [])]
 
         try:
             # if the channel doesn't have a guild attribute, we handle that
-            self.guild = channel.guild  # type: ignore
+            self.guild = channel.guild
         except AttributeError:
             self.guild = state._get_guild(utils._get_as_snowflake(data, 'guild_id'))
 
@@ -1456,7 +1508,15 @@ class Message(PartialMessage, Hashable):
                     # the channel will be the correct type here
                     ref.resolved = self.__class__(channel=chan, data=resolved, state=state)  # type: ignore
 
-        for handler in ('author', 'member', 'mentions', 'mention_roles'):
+        self.application: Optional[MessageApplication] = None
+        try:
+            application = data['application']
+        except KeyError:
+            pass
+        else:
+            self.application = MessageApplication(state=self._state, data=application)
+
+        for handler in ('author', 'member', 'mentions', 'mention_roles', 'components'):
             try:
                 getattr(self, f'_handle_{handler}')(data[handler])
             except KeyError:
@@ -1554,7 +1614,8 @@ class Message(PartialMessage, Hashable):
         self.flags = MessageFlags._from_value(value)
 
     def _handle_application(self, value: MessageApplicationPayload) -> None:
-        self.application = value
+        application = MessageApplication(state=self._state, data=value)
+        self.application = application
 
     def _handle_activity(self, value: MessageActivityPayload) -> None:
         self.activity = value
@@ -1627,8 +1688,14 @@ class Message(PartialMessage, Hashable):
                 if role is not None:
                     self.role_mentions.append(role)
 
-    def _handle_components(self, components: List[ComponentPayload]):
-        self.components = [_component_factory(d) for d in components]
+    def _handle_components(self, data: List[ComponentPayload]) -> None:
+        self.components = []
+
+        for component_data in data:
+            component = _component_factory(component_data)
+
+            if component is not None:
+                self.components.append(component)
 
     def _handle_interaction(self, data: MessageInteractionPayload):
         self.interaction = MessageInteraction(state=self._state, guild=self.guild, data=data)
@@ -1755,7 +1822,7 @@ class Message(PartialMessage, Hashable):
         )
 
     @utils.cached_slot_property('_cs_system_content')
-    def system_content(self) -> Optional[str]:
+    def system_content(self) -> str:
         r""":class:`str`: A property that returns the content that is rendered
         regardless of the :attr:`Message.type`.
 
@@ -1780,7 +1847,10 @@ class Message(PartialMessage, Hashable):
                 return f'{self.author.name} removed {self.mentions[0].name} from the thread.'
 
         if self.type is MessageType.channel_name_change:
-            return f'{self.author.name} changed the channel name: **{self.content}**'
+            if getattr(self.channel, 'parent', self.channel).type is ChannelType.forum:
+                return f'{self.author.name} changed the post title: **{self.content}**'
+            else:
+                return f'{self.author.name} changed the channel name: **{self.content}**'
 
         if self.type is MessageType.channel_icon_change:
             return f'{self.author.name} changed the channel icon.'
@@ -1869,6 +1939,9 @@ class Message(PartialMessage, Hashable):
         if self.type is MessageType.guild_invite_reminder:
             return 'Wondering who to invite?\nStart by inviting anyone who can help you build the server!'
 
+        # Fallback for unknown message types
+        return ''
+
     @overload
     async def edit(
         self,
@@ -1899,6 +1972,7 @@ class Message(PartialMessage, Hashable):
 
     async def edit(
         self,
+        *,
         content: Optional[str] = MISSING,
         embed: Optional[Embed] = MISSING,
         embeds: Sequence[Embed] = MISSING,
